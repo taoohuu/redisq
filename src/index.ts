@@ -60,7 +60,11 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
   private readonly reclaimMinIdleMs: number;
   private readonly reclaimBatchSize: number;
   private readonly onError?: (error: Error, context: string) => void;
-  private readonly onProcess?: (
+  private readonly onProcessStart?: (
+    event: string,
+    job: Job<QueueEvents, keyof QueueEvents>,
+  ) => void;
+  private readonly onProcessEnd?: (
     event: string,
     job: Job<QueueEvents, keyof QueueEvents>,
   ) => void;
@@ -84,6 +88,21 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
   private workerPromise: Promise<void> | null = null;
   private schedulerPromise: Promise<void> | null = null;
   private reclaimPromise: Promise<void> | null = null;
+  private readonly sleepResolvers = new Set<() => void>();
+
+  private readonly moveDelayedJobScript = `
+    local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+    if score == false then return 0 end
+    if tonumber(score) > tonumber(ARGV[2]) then return 0 end
+    local payload = redis.call('HGET', KEYS[2], ARGV[1])
+    if payload == false then
+      redis.call('ZREM', KEYS[1], ARGV[1])
+      return 0
+    end
+    redis.call('ZREM', KEYS[1], ARGV[1])
+    redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[3], '*', 'jobId', ARGV[1])
+    return 1
+  `;
 
   constructor(input: RedisQInput);
   constructor(connection: Redis);
@@ -154,7 +173,8 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     );
     this.onError = options.onError;
     this.onMetric = options.onMetric;
-    this.onProcess = options.onProcess;
+    this.onProcessStart = options.onProcessStart;
+    this.onProcessEnd = options.onProcessEnd;
   }
 
   async add<Event extends EventName<Events>>(
@@ -263,6 +283,8 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     this.running = false;
     this.stopped = true;
 
+    this.interrupt();
+
     await this.startPromise?.catch(() => undefined);
     await Promise.allSettled([
       this.workerPromise,
@@ -270,11 +292,10 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
       this.reclaimPromise,
     ]);
 
-    try {
-      await this.workerRedis.quit();
-    } catch {
-      this.workerRedis.disconnect();
-    }
+    await Promise.allSettled([
+      this.redis.quit().catch(() => this.redis.disconnect()),
+      this.workerRedis.quit().catch(() => this.workerRedis.disconnect()),
+    ]);
   }
 
   private normalizeOptions(input: RedisQInput | Redis): RedisQOptions {
@@ -471,43 +492,18 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
   }
 
   private async moveDelayedJob(delayedJobId: string): Promise<boolean> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      await this.redis.watch(this.delayKey, this.jobKey);
+    const result = (await this.redis.eval(
+      this.moveDelayedJobScript,
+      3,
+      this.delayKey,
+      this.jobKey,
+      this.streamKey,
+      delayedJobId,
+      Date.now(),
+      this.streamMaxLen,
+    )) as number;
 
-      const score = await this.redis.zscore(this.delayKey, delayedJobId);
-      const payload = await this.redis.hget(this.jobKey, delayedJobId);
-
-      if (score === null || Number(score) > Date.now()) {
-        await this.redis.unwatch();
-        return false;
-      }
-
-      if (payload === null) {
-        const cleanup = this.redis.multi();
-        cleanup.zrem(this.delayKey, delayedJobId);
-        const cleanupResult = await cleanup.exec();
-        return cleanupResult !== null;
-      }
-
-      const transaction = this.redis.multi();
-      transaction.zrem(this.delayKey, delayedJobId);
-      transaction.xadd(
-        this.streamKey,
-        "MAXLEN",
-        "~",
-        this.streamMaxLen,
-        "*",
-        "jobId",
-        delayedJobId,
-      );
-
-      const result = await transaction.exec();
-      if (result !== null) {
-        return true;
-      }
-    }
-
-    return false;
+    return result === 1;
   }
 
   private async reclaimPendingJobs(): Promise<number> {
@@ -522,6 +518,12 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     );
 
     const entries = this.parseClaimedEntries(result);
+
+    // Clean up PEL entries whose stream entries were already deleted
+    const deletedIds = this.parseDeletedIds(result);
+    if (deletedIds.length > 0) {
+      await this.redis.hdel(this.jobKey, ...deletedIds);
+    }
 
     if (entries.length === 0) {
       return 0;
@@ -568,6 +570,20 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
         entry[1].every((field) => typeof field === "string")
       );
     });
+  }
+
+  private parseDeletedIds(raw: unknown): string[] {
+    if (!Array.isArray(raw) || raw.length < 3) {
+      return [];
+    }
+
+    const deleted = raw[2];
+
+    if (!Array.isArray(deleted)) {
+      return [];
+    }
+
+    return deleted.filter((id): id is string => typeof id === "string");
   }
 
   private async getJobFromStreamEntry(
@@ -618,10 +634,14 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     }
 
     try {
+      this.onProcessStart?.(
+        String(job.event),
+        job as Job<QueueEvents, keyof QueueEvents>,
+      );
       await handler(job as Job<Events>);
       await this.finalizeJob(streamEntryId, job.id);
       this.recordMetric("processed", 1, "handler_success");
-      this.onProcess?.(
+      this.onProcessEnd?.(
         String(job.event),
         job as Job<QueueEvents, keyof QueueEvents>,
       );
@@ -721,7 +741,11 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     transaction.xack(this.streamKey, this.consumerGroup, streamEntryId);
     transaction.xdel(this.streamKey, streamEntryId);
     transaction.hdel(this.jobKey, jobId);
-    await transaction.exec();
+    const result = await transaction.exec();
+
+    if (result === null) {
+      throw new Error("Failed to finalize job");
+    }
   }
 
   private async deadLetterJob(
@@ -748,7 +772,11 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     transaction.xack(this.streamKey, this.consumerGroup, streamEntryId);
     transaction.xdel(this.streamKey, streamEntryId);
     transaction.hdel(this.jobKey, job.id);
-    await transaction.exec();
+    const result = await transaction.exec();
+
+    if (result === null) {
+      throw new Error("Failed to dead letter job");
+    }
 
     this.recordMetric("failed", 1, "dead_letter_missing_handler");
     this.recordMetric("deadLettered", 1, "dead_letter_missing_handler");
@@ -758,13 +786,29 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     const transaction = this.redis.multi();
     transaction.xack(this.streamKey, this.consumerGroup, streamEntryId);
     transaction.xdel(this.streamKey, streamEntryId);
-    await transaction.exec();
+    const result = await transaction.exec();
+
+    if (result === null) {
+      throw new Error("Failed to ack and delete stream entry");
+    }
   }
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => {
-      setTimeout(resolve, ms);
+      const wake = () => {
+        clearTimeout(timer);
+        this.sleepResolvers.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, ms);
+      this.sleepResolvers.add(wake);
     });
+  }
+
+  private interrupt(): void {
+    for (const wake of this.sleepResolvers) {
+      wake();
+    }
   }
 
   private reportError(error: unknown, context: string): void {
@@ -792,6 +836,7 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
 
 export type {
   Job,
+  QueueOptions,
   RedisQMetric,
   RedisQStats,
   QueueEvents,

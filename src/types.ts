@@ -29,7 +29,14 @@ interface RedisQOptions {
   reclaimMinIdleMs?: number;
   reclaimBatchSize?: number;
   onError?: (error: Error, context: string) => void;
-  onProcess?: (event: string, job: Job<QueueEvents, keyof QueueEvents>) => void;
+  onProcessStart?: (
+    event: string,
+    job: Job<QueueEvents, keyof QueueEvents>,
+  ) => void;
+  onProcessEnd?: (
+    event: string,
+    job: Job<QueueEvents, keyof QueueEvents>,
+  ) => void;
   onMetric?: (metric: RedisQMetric) => void;
 }
 

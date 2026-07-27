@@ -381,7 +381,8 @@ type RedisQOptions = {
   reclaimBatchSize?: number;
 
   onError?(error: Error, context: string): void;
-  onProcess?(event: string, job: Job<QueueEvents, keyof QueueEvents>) => void
+  onProcessStart?(event: string, job: Job<QueueEvents, keyof QueueEvents>) => void;
+  onProcessEnd?(event: string, job: Job<QueueEvents, keyof QueueEvents>) => void;
   onMetric?(metric: RedisQMetric): void;
 };
 ```
@@ -406,7 +407,7 @@ Handlers should be idempotent because retries and recovery may execute a job mor
 
 - Use one Consumer Group per application.
 - Give every worker a unique Consumer Name.
-- Monitor `onMetric`, `onProcess`, and `onError`.
+- Monitor `onMetric`, `onProcessStart`, `onProcessEnd`, and `onError`.
 - Configure stream trimming according to retention requirements.
 - Enable Redis persistence for durability.
 
