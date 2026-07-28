@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@taoohuu/redisq">
-    <img src="https://img.shields.io/npm/v/@taoohuu/redisq" alt="npm">
+  <a href="https://www.npmjs.com/package/@wnlx/redisq">
+    <img src="https://img.shields.io/npm/v/@wnlx/redisq" alt="npm">
   </a>
 
   <a href="https://github.com/taoohuu/redisq">
@@ -30,7 +30,7 @@
 
 RedisQ is a lightweight, type-safe event queue for TypeScript built on **Redis Streams** and **Consumer Groups**.
 
-If you've ever used Node.js's `EventEmitter`, RedisQ will feel instantly familiar, except your events are processed reliably across multiple workers and even multiple machines.
+If you've ever used Node.js's `EventEmitter`, RedisQ will feel instantly familiar. But except your events are processed reliably across multiple workers and even multiple machines.
 
 ```ts
 q.on("send-email", async (job) => {
@@ -57,12 +57,11 @@ Instead of defining processors and queues, you publish **typed events** and subs
 ### Features
 
 - ✅ Event-driven API
-- ✅ Type-safe payloads
-- ✅ Redis Streams
-- ✅ Consumer Groups
+- ✅ Type-safe payloads with full inference
+- ✅ Redis Streams + Consumer Groups
 - ✅ Multi-worker processing
 - ✅ Delayed events
-- ✅ Automatic retries
+- ✅ Automatic retries with exponential backoff
 - ✅ Dead-letter queue
 - ✅ Pending recovery (`XAUTOCLAIM`)
 - ✅ Graceful shutdown
@@ -74,22 +73,22 @@ Instead of defining processors and queues, you publish **typed events** and subs
 ## Installation
 
 ```bash
-bun add @taoohuu/redisq
+bun add @wnlx/redisq
 ```
 
 or
 
 ```bash
-npm install @taoohuu/redisq
+npm install @wnlx/redisq
 ```
 
 ---
 
-# Quick Start
+## Quick Start
 
 ```ts
 import Redis from "ioredis";
-import { RedisQ } from "@taoohuu/redisq";
+import { RedisQ } from "@wnlx/redisq";
 
 interface Events {
   "send-email": {
@@ -121,9 +120,7 @@ await q.add(
     subject: "Welcome!",
     body: "Thanks for joining!",
   },
-  {
-    delay: 5000,
-  },
+  { delay: 5000 },
 );
 
 await q.stop();
@@ -131,7 +128,7 @@ await q.stop();
 
 ---
 
-# Programming Model
+## Programming Model
 
 RedisQ follows the same mental model as Node.js events.
 
@@ -147,7 +144,7 @@ You write event-driven code exactly as you would in Node.js, while RedisQ handle
 
 ---
 
-# Architecture
+## Architecture
 
 ```
           Producer
@@ -175,7 +172,7 @@ Failure
    │
    ▼
 
- Retry Queue
+ Retry Queue (delay sorted set)
 
    │
    ▼
@@ -185,98 +182,70 @@ Failure
 
 ---
 
-# Public API
+## Public API
 
-## `RedisQ<Events>`
+### `new RedisQ<Events>(options)`
 
-```ts
-new RedisQ(options)
-
-add(event, data, options?)
-
-cancel(jobId)
-
-on(event, handler)
-
-start()
-
-stop()
-
-getStats()
-```
+Creates a new queue instance. RedisQ owns two internal Redis connections (duplicated from the one you provide) and will close them on `stop()`. Your original connection is never closed by RedisQ.
 
 ---
 
-## add()
+### `add(event, data, options?)`
 
-Publish a typed event.
+Publish a typed event. Returns the generated job ID.
 
 ```ts
-await q.add(
+const jobId = await q.add(
   "send-email",
-  {
-    to: "john@example.com",
-    subject: "Hi",
-    body: "Hello",
-  },
-  {
-    delay: 10000,
-  },
+  { to: "john@example.com", subject: "Hi", body: "Hello" },
+  { delay: 10000 }, // optional, milliseconds
 );
 ```
 
-Returns the generated Job ID.
+Jobs with no `delay` (or `delay: 0`) are dispatched to the stream immediately. Jobs with a `delay` are held in a sorted set and promoted to the stream when their time comes.
 
 ---
 
-## on()
+### `on(event, handler)`
 
-Register an event handler.
+Register an event handler. The payload is automatically typed from your event interface.
 
 ```ts
 q.on("resize-image", async (job) => {
-  console.log(job.data.path);
+  console.log(job.data.path); // string
+  console.log(job.data.width); // number
 });
 ```
 
-The payload is automatically typed from your event interface.
-
 ---
 
-## cancel()
+### `cancel(jobId)`
 
-Best-effort cancellation.
+Best-effort cancellation. Returns `true` if the job was removed, `false` otherwise.
 
 ```ts
 const cancelled = await q.cancel(jobId);
 ```
 
-Returns
-
-- `true` if removed
-- `false` if no cancellable job exists
+> **Note:** Cancellation only works for jobs that are still in the delay queue (i.e. have not yet been promoted to the stream). Once a job has been dispatched to the stream, `cancel()` returns `false` and the job will be processed.
 
 ---
 
-## start()
+### `start()`
 
-Starts workers and scheduler.
-
-Creates the Consumer Group automatically if it does not exist.
+Starts the worker, scheduler, and reclaim loops. Creates the Consumer Group automatically if it does not exist. Calling `start()` multiple times is safe — concurrent calls await the same initialization.
 
 ---
 
-## stop()
+### `stop()`
 
-Gracefully stops workers and closes Redis connections.
-
-A stopped instance cannot be restarted.
+Gracefully shuts down all loops and closes both internal Redis connections. A stopped instance cannot be restarted.
 
 ---
 
-## getStats()
+### `getStats()`
 
-Returns runtime metrics for the current process.
+Returns a snapshot of runtime metrics for the **current process**. In a multi-worker deployment each worker tracks its own counters independently.
 
 ```ts
 type RedisQStats = {
@@ -292,7 +261,9 @@ type RedisQStats = {
 
 ---
 
-# Type Safety
+## Type Safety
+
+Payloads are fully inferred from your event interface, no casts needed anywhere.
 
 ```ts
 interface Events {
@@ -301,7 +272,6 @@ interface Events {
     subject: string;
     body: string;
   };
-
   "resize-image": {
     path: string;
     width: number;
@@ -322,95 +292,120 @@ q.on("resize-image", async (job) => {
 });
 ```
 
----
-
-# Reliability
-
-RedisQ provides **at-least-once delivery**.
-
-Successful handlers are acknowledged and removed from the stream.
-
-Failed handlers are retried using exponential backoff before eventually being moved to a Dead Letter Queue.
-
-## Retries
-
-- Exponential backoff
-- Configurable retry limit
-- Optional jitter
-
-## Dead Letter Queue
-
-Jobs exceeding the retry limit are moved into a dedicated DLQ stream.
-
-## Pending Recovery
-
-Workers automatically reclaim abandoned pending messages using `XAUTOCLAIM`.
-
-This allows another worker to continue processing after crashes or unexpected shutdowns.
-
----
-
-# Configuration
+The `onProcessStart` and `onProcessEnd` hooks are also fully typed, narrowing `event` automatically narrows `job.data`:
 
 ```ts
-type RedisQOptions = {
-  redis: Redis;
-
-  streamKey?: string;
-  delayKey?: string;
-  jobKey?: string;
-  dlqKey?: string;
-
-  consumerGroup?: string;
-  consumerName?: string;
-
-  blockMs?: number;
-  schedulerIntervalMs?: number;
-  batchSize?: number;
-
-  streamMaxLen?: number;
-  dlqMaxLen?: number;
-
-  retryLimit?: number;
-  retryBaseDelayMs?: number;
-  retryMaxDelayMs?: number;
-  retryJitterMs?: number;
-
-  reclaimIntervalMs?: number;
-  reclaimMinIdleMs?: number;
-  reclaimBatchSize?: number;
-
-  onError?(error: Error, context: string): void;
-  onProcessStart?(event: string, job: Job<QueueEvents, keyof QueueEvents>) => void;
-  onProcessEnd?(event: string, job: Job<QueueEvents, keyof QueueEvents>) => void;
-  onMetric?(metric: RedisQMetric): void;
-};
+const q = new RedisQ<Events>({
+  redis,
+  onProcessStart(event, job) {
+    if (event === "send-email") {
+      console.log(job.data.to); // string
+    }
+    if (event === "resize-image") {
+      console.log(job.data.width); // number
+    }
+  },
+});
 ```
 
 ---
 
-# Delivery Semantics
+## Reliability
+
+RedisQ provides **at-least-once delivery**.
+
+Successful handlers are acknowledged and removed from the stream. Failed handlers are retried using exponential backoff before eventually being moved to a Dead Letter Queue.
+
+Handlers should be **idempotent** — retries and crash recovery may execute a job more than once.
+
+### Retries
+
+Failed handlers are retried up to `retryLimit` times using exponential backoff with optional jitter. Between retries the job is held in the delay sorted set.
+
+### Dead Letter Queue
+
+Jobs that exceed the retry limit are moved into a dedicated DLQ stream (`redisq:dlq` by default) with their final error message and attempt count attached.
+
+### Pending Recovery
+
+Workers periodically call `XAUTOCLAIM` to reclaim messages that have been pending longer than `reclaimMinIdleMs`. This allows another worker to pick up jobs abandoned by a crashed consumer.
+
+---
+
+## Configuration
+
+```ts
+interface RedisQOptions<Events> {
+  // Required
+  redis: Redis;
+
+  // Redis key names
+  streamKey?: string; // default: "redisq:stream"
+  delayKey?: string; // default: "redisq:delay"
+  jobKey?: string; // default: "redisq:job"
+  dlqKey?: string; // default: "redisq:dlq"
+
+  // Consumer identity
+  consumerGroup?: string; // default: "redisq"
+  consumerName?: string; // default: "consumer-<uuid>"
+
+  // Tuning
+  blockMs?: number; // default: 1000
+  schedulerIntervalMs?: number; // default: 250
+  batchSize?: number; // default: 50
+  streamMaxLen?: number; // default: 10000
+  dlqMaxLen?: number; // default: 10000
+
+  // Retries
+  retryLimit?: number; // default: 3
+  retryBaseDelayMs?: number; // default: 1000
+  retryMaxDelayMs?: number; // default: 60000
+  retryJitterMs?: number; // default: 250
+
+  // Reclaim
+  reclaimIntervalMs?: number; // default: 2000
+  reclaimMinIdleMs?: number; // default: 30000
+  reclaimBatchSize?: number; // default: 50
+
+  // Hooks
+  onError?(error: Error, context: string): void;
+  onProcessStart?(
+    event: EventName<Events>,
+    job: Job<Events, EventName<Events>>,
+  ): void;
+  onProcessEnd?(
+    event: EventName<Events>,
+    job: Job<Events, EventName<Events>>,
+  ): void;
+  onMetric?(metric: RedisQMetric): void;
+}
+```
+
+---
+
+## Delivery Semantics
 
 RedisQ guarantees:
 
 - At-least-once delivery
-- Ordered events within a stream
-- Reliable acknowledgements
-- Automatic recovery
-- Distributed processing
-
-Handlers should be idempotent because retries and recovery may execute a job more than once.
+- Ordered processing within a stream
+- Reliable acknowledgements via `XACK` + `XDEL`
+- Automatic crash recovery via `XAUTOCLAIM`
+- Distributed processing across multiple workers
 
 ---
 
-# Production Tips
+## Production Tips
 
 - Use one Consumer Group per application.
-- Give every worker a unique Consumer Name.
-- Monitor `onMetric`, `onProcessStart`, `onProcessEnd`, and `onError`.
-- Configure stream trimming according to retention requirements.
-- Enable Redis persistence for durability.
+- Give every worker a unique `consumerName` (the default UUID is fine).
+- Monitor `onMetric`, `onProcessStart`, `onProcessEnd`, and `onError` for observability.
+- Configure `streamMaxLen` and `dlqMaxLen` to match your retention requirements.
+- Enable Redis persistence (`AOF` or `RDB`) for durability.
+- Make handlers idempotent, at-least-once delivery means a job may run more than once.
 
-# License
+---
+
+## License
 
 MIT
