@@ -1,6 +1,6 @@
 {
-  "name": "@taoohuu/redisq",
-  "version": "1.0.2",
+  "name": "@wnlx/redisq",
+  "version": "0.1.0",
   "description": "Event-driven Redis Streams message broker for TypeScript",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -39,5 +39,20 @@
     "@types/bun": "latest",
     "tsup": "^8.5.0",
     "typescript": "^5.9.2"
-  }
+  },
+  "keywords": [
+    "redis",
+    "queue",
+    "redis-queue",
+    "message-queue",
+    "job-queue",
+    "task-queue",
+    "background-jobs",
+    "event-emitter",
+    "typescript",
+    "delayed-jobs",
+    "ioredis",
+    "worker",
+    "mq"
+  ]
 }
