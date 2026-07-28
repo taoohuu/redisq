@@ -4,11 +4,19 @@ type QueueEvents = object;
 
 type EventName<Events extends QueueEvents> = Extract<keyof Events, string>;
 
+type ProcessCallbackArgs<Events extends QueueEvents> = {
+  [E in EventName<Events>]: [event: E, job: Job<Events, E>];
+}[EventName<Events>];
+
+type ProcessCallback<Events extends QueueEvents> = (
+  ...args: ProcessCallbackArgs<Events>
+) => void;
+
 interface QueueOptions {
   delay?: number;
 }
 
-interface RedisQOptions {
+interface RedisQOptions<Events extends QueueEvents = QueueEvents> {
   redis: Redis;
   streamKey?: string;
   delayKey?: string;
@@ -28,15 +36,9 @@ interface RedisQOptions {
   reclaimIntervalMs?: number;
   reclaimMinIdleMs?: number;
   reclaimBatchSize?: number;
+  onProcessStart?: ProcessCallback<Events>;
+  onProcessEnd?: ProcessCallback<Events>;
   onError?: (error: Error, context: string) => void;
-  onProcessStart?: (
-    event: string,
-    job: Job<QueueEvents, keyof QueueEvents>,
-  ) => void;
-  onProcessEnd?: (
-    event: string,
-    job: Job<QueueEvents, keyof QueueEvents>,
-  ) => void;
   onMetric?: (metric: RedisQMetric) => void;
 }
 
@@ -70,11 +72,13 @@ interface Job<
 }
 
 export type {
-  EventName,
-  Job,
   QueueEvents,
-  RedisQMetric,
+  EventName,
+  ProcessCallbackArgs,
+  ProcessCallback,
   QueueOptions,
   RedisQOptions,
+  RedisQMetric,
   RedisQStats,
+  Job,
 };

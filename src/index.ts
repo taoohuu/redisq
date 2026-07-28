@@ -1,12 +1,13 @@
 import type Redis from "ioredis";
 import type {
-  EventName,
   Job,
+  EventName,
   RedisQMetric,
   QueueEvents,
   RedisQOptions,
   RedisQStats,
   QueueOptions,
+  ProcessCallback,
 } from "./types";
 
 type StoredJob<Events extends QueueEvents> = {
@@ -17,8 +18,6 @@ type StoredJob<Events extends QueueEvents> = {
   scheduledAt: number;
   attempts: number;
 };
-
-type RedisQInput = Redis | RedisQOptions;
 
 const DEFAULT_STREAM_KEY = "redisq:stream";
 const DEFAULT_DELAY_KEY = "redisq:delay";
@@ -59,15 +58,9 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
   private readonly reclaimIntervalMs: number;
   private readonly reclaimMinIdleMs: number;
   private readonly reclaimBatchSize: number;
+  private readonly onProcessStart?: ProcessCallback<Events>;
+  private readonly onProcessEnd?: ProcessCallback<Events>;
   private readonly onError?: (error: Error, context: string) => void;
-  private readonly onProcessStart?: (
-    event: string,
-    job: Job<QueueEvents, keyof QueueEvents>,
-  ) => void;
-  private readonly onProcessEnd?: (
-    event: string,
-    job: Job<QueueEvents, keyof QueueEvents>,
-  ) => void;
   private readonly onMetric?: (metric: RedisQMetric) => void;
   private readonly handlers = new Map<
     string,
@@ -104,9 +97,9 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     return 1
   `;
 
-  constructor(input: RedisQInput);
+  constructor(input: Redis | RedisQOptions<Events>);
   constructor(connection: Redis);
-  constructor(input: RedisQInput | Redis) {
+  constructor(input: Redis | RedisQOptions<Events>) {
     const options = this.normalizeOptions(input);
 
     const rawPrefix = options.redis.options?.keyPrefix;
@@ -173,8 +166,12 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     );
     this.onError = options.onError;
     this.onMetric = options.onMetric;
-    this.onProcessStart = options.onProcessStart;
-    this.onProcessEnd = options.onProcessEnd;
+    if (options.onProcessStart) {
+      this.onProcessStart = options.onProcessStart;
+    }
+    if (options.onProcessEnd) {
+      this.onProcessEnd = options.onProcessEnd;
+    }
   }
 
   async add<Event extends EventName<Events>>(
@@ -298,7 +295,9 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     ]);
   }
 
-  private normalizeOptions(input: RedisQInput | Redis): RedisQOptions {
+  private normalizeOptions(
+    input: Redis | RedisQOptions<Events>,
+  ): RedisQOptions<Events> {
     if (this.isRedisQOptions(input)) {
       return input;
     }
@@ -306,7 +305,9 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     return { redis: input };
   }
 
-  private isRedisQOptions(input: RedisQInput | Redis): input is RedisQOptions {
+  private isRedisQOptions(
+    input: Redis | RedisQOptions<Events>,
+  ): input is RedisQOptions<Events> {
     return typeof input === "object" && input !== null && "redis" in input;
   }
 
@@ -634,17 +635,11 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     }
 
     try {
-      this.onProcessStart?.(
-        String(job.event),
-        job as Job<QueueEvents, keyof QueueEvents>,
-      );
+      this.onProcessStart?.(job.event, job);
       await handler(job as Job<Events>);
       await this.finalizeJob(streamEntryId, job.id);
       this.recordMetric("processed", 1, "handler_success");
-      this.onProcessEnd?.(
-        String(job.event),
-        job as Job<QueueEvents, keyof QueueEvents>,
-      );
+      this.onProcessEnd?.(job.event, job);
     } catch (error) {
       await this.handleJobFailure(streamEntryId, job, error);
       this.reportError(error, `handler:${String(job.event)}`);
