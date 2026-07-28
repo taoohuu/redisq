@@ -240,6 +240,44 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     return wasCancelled;
   }
 
+  async retryDLQJobs(
+    event?: EventName<Events> | Array<EventName<Events>>,
+  ): Promise<number> {
+    const entries = await this.redis.xrange(this.dlqKey, "-", "+");
+    let requeuedCount = 0;
+
+    for (const [streamEntryId, fields] of entries) {
+      const jobIndex = fields.indexOf("job");
+      if (jobIndex === -1 || jobIndex + 1 >= fields.length) continue;
+
+      try {
+        const rawJob = fields[jobIndex + 1];
+
+        if (!rawJob) {
+          continue;
+        }
+
+        const parsed = JSON.parse(rawJob) as StoredJob<Events>;
+
+        if (event) {
+          const events = Array.isArray(event) ? event : [event];
+          if (!events.includes(parsed.event)) {
+            continue;
+          }
+        }
+
+        await this.add(parsed.event, parsed.data);
+
+        await this.redis.xdel(this.dlqKey, streamEntryId);
+        requeuedCount++;
+      } catch (err) {
+        this.reportError(err, "requeue_dlq");
+      }
+    }
+
+    return requeuedCount;
+  }
+
   getStats(): RedisQStats {
     return { ...this.stats };
   }

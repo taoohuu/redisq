@@ -231,6 +231,25 @@ const cancelled = await q.cancel(jobId);
 
 ---
 
+### `retryDLQJobs(events?)`
+
+Re-queues jobs from the Dead-Letter Queue (DLQ) back into the active queue for re-processing and returns the total number of requeued messages.
+
+> **Note:** By default, calling `retryDLQJobs()` will attempt to requeue **all** jobs in the DLQ. You can optionally pass a single event name or an array of event names to only retry specific job types.
+
+```ts
+// Retry all DLQ jobs
+const count = await q.retryDLQJobs();
+
+// Retry a single event type
+await q.retryDLQJobs("send-email");
+
+// Retry multiple specific event types
+await q.retryDLQJobs(["send-email", "resize-image"]);
+```
+
+---
+
 ### `start()`
 
 Starts the worker, scheduler, and reclaim loops. Creates the Consumer Group automatically if it does not exist. Calling `start()` multiple times is safe — concurrent calls await the same initialization.
@@ -326,6 +345,8 @@ Failed handlers are retried up to `retryLimit` times using exponential backoff w
 
 Jobs that exceed the retry limit are moved into a dedicated DLQ stream (`redisq:dlq` by default) with their final error message and attempt count attached.
 
+DLQ jobs can be retried by manually calling `retryDLQJobs()`. The DLQ jobs will be requeued and then processed normally.
+
 ### Pending Recovery
 
 Workers periodically call `XAUTOCLAIM` to reclaim messages that have been pending longer than `reclaimMinIdleMs`. This allows another worker to pick up jobs abandoned by a crashed consumer.
@@ -368,7 +389,6 @@ interface RedisQOptions<Events> {
   reclaimBatchSize?: number; // default: 50
 
   // Hooks
-  onError?(error: Error, context: string): void;
   onProcessStart?(
     event: EventName<Events>,
     job: Job<Events, EventName<Events>>,
@@ -378,6 +398,7 @@ interface RedisQOptions<Events> {
     job: Job<Events, EventName<Events>>,
   ): void;
   onMetric?(metric: RedisQMetric): void;
+  onError?(error: Error, context: string): void;
 }
 ```
 
