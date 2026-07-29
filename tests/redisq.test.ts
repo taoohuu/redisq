@@ -62,7 +62,7 @@ beforeEach(async () => {
 afterEach(async () => {
   // Stop queue if still running
   try {
-    await q?.stop();
+    await q?.stopWorker();
   } catch {}
 
   // Flush all keys created by this test
@@ -91,8 +91,8 @@ describe("constructor", () => {
 
   test("does not close the user's Redis instance after stop()", async () => {
     q = new RedisQ({ redis, streamKey: `${prefix}stream` });
-    await q.start();
-    await q.stop();
+    await q.startWorker();
+    await q.stopWorker();
     // The user's connection should still work
     await expect(redis.ping()).resolves.toBe("PONG");
   });
@@ -118,7 +118,7 @@ describe("add + on + start", () => {
       received.push(job.data.name);
     });
 
-    await q.start();
+    await q.startWorker();
     await q.add("greet", { name: "Alice" });
     await waitUntil(() => received.length === 1);
 
@@ -140,7 +140,7 @@ describe("add + on + start", () => {
       received.push(job.data.name);
     });
 
-    await q.start();
+    await q.startWorker();
     await q.add("greet", { name: "Alice" });
     await q.add("greet", { name: "Bob" });
     await q.add("greet", { name: "Carol" });
@@ -163,7 +163,7 @@ describe("add + on + start", () => {
       processed = true;
     });
 
-    await q.start();
+    await q.startWorker();
     const id = await q.add("greet", { name: "Alice" });
 
     await waitUntil(() => processed);
@@ -186,7 +186,7 @@ describe("add + on + start", () => {
     });
 
     await q.add("greet", { name: "PreStart" });
-    await q.start();
+    await q.startWorker();
 
     await waitUntil(() => received.length === 1);
     expect(received[0]).toBe("PreStart");
@@ -213,7 +213,7 @@ describe("delayed jobs", () => {
       received.push(job.data.name);
     });
 
-    await q.start();
+    await q.startWorker();
     await q.add("greet", { name: "Delayed" }, { delay: 300 });
 
     await Bun.sleep(100);
@@ -235,7 +235,7 @@ describe("delayed jobs", () => {
       received.push(job.data.name);
     });
 
-    await q.start();
+    await q.startWorker();
     await q.add("greet", { name: "Delayed" }, { delay: 200 });
 
     await waitUntil(() => received.length === 1, 3000);
@@ -292,7 +292,7 @@ describe("retries", () => {
       throw new Error("boom");
     });
 
-    await q.start();
+    await q.startWorker();
     await q.add("fail", { reason: "test" });
 
     // 1 initial + 2 retries = 3 total handler calls, then DLQ
@@ -317,7 +317,7 @@ describe("retries", () => {
       throw new Error("always fails");
     });
 
-    await q.start();
+    await q.startWorker();
     await q.add("fail", { reason: "test" });
 
     // Poll DLQ directly — handler increments attempts before the throw,
@@ -357,7 +357,7 @@ describe("retries", () => {
       throw new Error("x");
     });
 
-    await q.start();
+    await q.startWorker();
     const id = await q.add("fail", { reason: "test" });
 
     await waitUntil(() => done);
@@ -387,7 +387,7 @@ describe("missing handler", () => {
       },
     });
 
-    await q.start();
+    await q.startWorker();
     await q.add("greet", { name: "Ghost" });
 
     // Poll DLQ rather than relying on onError timing + fixed sleep.
@@ -422,7 +422,7 @@ describe("cancel", () => {
       received.push(job.data.name);
     });
 
-    await q.start();
+    await q.startWorker();
     const id = await q.add("greet", { name: "CancelMe" }, { delay: 500 });
     const cancelled = await q.cancel(id);
 
@@ -451,7 +451,7 @@ describe("cancel", () => {
       done = true;
     });
 
-    await q.start();
+    await q.startWorker();
     const id = await q.add("greet", { name: "Alice" });
 
     await waitUntil(() => done);
@@ -475,7 +475,7 @@ describe("getStats", () => {
     });
 
     q.on("greet", () => {});
-    await q.start();
+    await q.startWorker();
 
     await q.add("greet", { name: "A" });
     await q.add("greet", { name: "B" });
@@ -506,7 +506,7 @@ describe("getStats", () => {
       throw new Error("x");
     });
 
-    await q.start();
+    await q.startWorker();
     await q.add("fail", { reason: "test" });
 
     await waitUntil(() => calls >= 2, 5000);
@@ -570,7 +570,7 @@ describe("onProcessStart / onProcessEnd", () => {
       timeline.push("handler");
     });
 
-    await q.start();
+    await q.startWorker();
     await q.add("greet", { name: "Alice" });
 
     await waitUntil(() => timeline.length === 3);
@@ -601,7 +601,7 @@ describe("onProcessStart / onProcessEnd", () => {
       throw new Error("x");
     });
 
-    await q.start();
+    await q.startWorker();
     await q.add("fail", { reason: "test" });
 
     await waitUntil(() => called);
@@ -630,7 +630,7 @@ describe("onMetric", () => {
     });
 
     q.on("greet", () => {});
-    await q.start();
+    await q.startWorker();
     await q.add("greet", { name: "Alice" });
 
     await waitUntil(() => metrics.includes("processed"));
@@ -646,23 +646,23 @@ describe("onMetric", () => {
 describe("lifecycle", () => {
   test("start() is idempotent", async () => {
     q = new RedisQ({ redis });
-    await Promise.all([q.start(), q.start(), q.start()]);
+    await Promise.all([q.startWorker(), q.startWorker(), q.startWorker()]);
     // No error thrown, still running
     expect(q.getStats()).toBeDefined();
   });
 
   test("stop() after stop() does not throw", async () => {
     q = new RedisQ({ redis });
-    await q.start();
-    await q.stop();
-    await expect(q.stop()).resolves.toBeUndefined();
+    await q.startWorker();
+    await q.stopWorker();
+    await expect(q.stopWorker()).resolves.toBeUndefined();
   });
 
   test("start() after stop() throws", async () => {
     q = new RedisQ({ redis });
-    await q.start();
-    await q.stop();
-    await expect(q.start()).rejects.toThrow("Cannot restart");
+    await q.startWorker();
+    await q.stopWorker();
+    await expect(q.startWorker()).rejects.toThrow("Cannot restart");
   });
 
   test("stop() resolves promptly (within 2x blockMs)", async () => {
@@ -679,10 +679,10 @@ describe("lifecycle", () => {
     });
 
     q.on("greet", () => {});
-    await q.start();
+    await q.startWorker();
 
     const t0 = Date.now();
-    await q.stop();
+    await q.stopWorker();
     const elapsed = Date.now() - t0;
 
     expect(elapsed).toBeLessThan(blockMs * 2 + 200);
@@ -709,7 +709,7 @@ describe("lifecycle", () => {
     q.on("fail", () => {
       throw new Error("handler boom");
     });
-    await q.start();
+    await q.startWorker();
     await q.add("fail", { reason: "test" });
 
     await waitUntil(() => errors.length > 0, 3000);

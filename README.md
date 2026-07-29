@@ -30,7 +30,7 @@
 
 RedisQ is a lightweight, type-safe event queue for TypeScript built on **Redis Streams** and **Consumer Groups**.
 
-If you've ever used Node.js's `EventEmitter`, RedisQ will feel instantly familiar. But except your events are processed reliably across multiple workers and even multiple machines.
+If you've ever used Node.js's `EventEmitter`, RedisQ will feel instantly familiar — except your events are processed reliably across multiple workers and even multiple machines.
 
 ```ts
 q.on("send-email", async (job) => {
@@ -62,7 +62,7 @@ Instead of defining processors and queues, you publish **typed events** and subs
 - ✅ Multi-worker processing
 - ✅ Delayed events
 - ✅ Automatic retries with exponential backoff
-- ✅ Dead-letter queue
+- ✅ Dead-letter queue (with retry method)
 - ✅ Pending recovery (`XAUTOCLAIM`)
 - ✅ Graceful shutdown
 - ✅ Runtime metrics
@@ -85,6 +85,35 @@ npm install @wnlx/redisq
 ---
 
 ## Quick Start
+
+RedisQ separates **producing** and **consuming**. A producer just constructs the queue and calls `add()`. A consumer additionally registers handlers and calls `startWorker()`.
+
+### Producer
+
+```ts
+import Redis from "ioredis";
+import { RedisQ } from "@wnlx/redisq";
+
+interface Events {
+  "send-email": {
+    to: string;
+    subject: string;
+    body: string;
+  };
+}
+
+const redis = new Redis("redis://localhost:6379");
+const q = new RedisQ<Events>({ redis });
+
+// No startWorker() needed — producers just add jobs
+await q.add(
+  "send-email",
+  { to: "john@example.com", subject: "Welcome!", body: "Thanks for joining!" },
+  { delay: 5000 },
+);
+```
+
+### Consumer
 
 ```ts
 import Redis from "ioredis";
@@ -111,19 +140,10 @@ q.on("send-email", async (job) => {
   console.log(job.data.to);
 });
 
-await q.start();
+await q.startWorker();
 
-await q.add(
-  "send-email",
-  {
-    to: "john@example.com",
-    subject: "Welcome!",
-    body: "Thanks for joining!",
-  },
-  { delay: 5000 },
-);
-
-await q.stop();
+// On shutdown:
+await q.stopWorker();
 ```
 
 ---
@@ -147,37 +167,33 @@ You write event-driven code exactly as you would in Node.js, while RedisQ handle
 ## Architecture
 
 ```
-          Producer
+       Producer
 
-     q.add("send-email")
+  q.add("send-email")
+          │
+          ▼
+    Redis Stream
+          │
+   Consumer Group
+          │
+  ┌───────┴────────┐
+  ▼                ▼
 
-             │
-             ▼
+Worker A        Worker B
 
-      Redis Stream
-             │
-
-      Consumer Group
-             │
-
-     ┌───────┴────────┐
-     ▼                ▼
-
- Worker A         Worker B
-
-     │                │
-     └────── ACK ─────┘
+  │                │
+  └────── ACK ─────┘
 
 Failure
-   │
-   ▼
+  │
+  ▼
 
- Retry Queue (delay sorted set)
+Retry Queue (delay sorted set)
 
-   │
-   ▼
+  │
+  ▼
 
- Dead Letter Queue
+Dead Letter Queue
 ```
 
 ---
@@ -186,13 +202,13 @@ Failure
 
 ### `new RedisQ<Events>(options)`
 
-Creates a new queue instance. RedisQ owns two internal Redis connections (duplicated from the one you provide) and will close them on `stop()`. Your original connection is never closed by RedisQ.
+Creates a new queue instance. RedisQ duplicates two internal Redis connections from the one you provide and manages their lifecycle. Your original connection is never closed by RedisQ unless specified in `startWorker(closeOriginalConnection?)`.
 
 ---
 
 ### `add(event, data, options?)`
 
-Publish a typed event. Returns the generated job ID.
+Publish a typed event. Returns the generated job ID. Works on both producer and consumer instances, with or without `startWorker()`.
 
 ```ts
 const jobId = await q.add(
@@ -208,7 +224,7 @@ Jobs with no `delay` (or `delay: 0`) are dispatched to the stream immediately. J
 
 ### `on(event, handler)`
 
-Register an event handler. The payload is automatically typed from your event interface.
+Register an event handler. The payload is automatically typed from your event interface. Only relevant on consumer instances.
 
 ```ts
 q.on("resize-image", async (job) => {
@@ -227,15 +243,13 @@ Best-effort cancellation. Returns `true` if the job was removed, `false` otherwi
 const cancelled = await q.cancel(jobId);
 ```
 
-> **Note:** Cancellation only works for jobs that are still in the delay queue (i.e. have not yet been promoted to the stream). Once a job has been dispatched to the stream, `cancel()` returns `false` and the job will be processed.
+> **Note:** Cancellation only works for jobs still in the delay queue. Once a job has been promoted to the stream it will be processed — `cancel()` returns `false` in that case.
 
 ---
 
-### `retryDLQJobs(events?)`
+### `retryDLQJobs(event?)`
 
-Re-queues jobs from the Dead-Letter Queue (DLQ) back into the active queue for re-processing and returns the total number of requeued messages.
-
-> **Note:** By default, calling `retryDLQJobs()` will attempt to requeue **all** jobs in the DLQ. You can optionally pass a single event name or an array of event names to only retry specific job types.
+Re-queues jobs from the Dead Letter Queue back into the active queue and returns the number of jobs requeued. Optionally filter by event name or an array of event names.
 
 ```ts
 // Retry all DLQ jobs
@@ -244,19 +258,31 @@ const count = await q.retryDLQJobs();
 // Retry a single event type
 await q.retryDLQJobs("send-email");
 
-// Retry multiple specific event types
+// Retry multiple event types
 await q.retryDLQJobs(["send-email", "resize-image"]);
 ```
 
 ---
 
-### `start()`
+### `startWorker(closeOriginalConnection?)`
 
-Starts the worker, scheduler, and reclaim loops. Creates the Consumer Group automatically if it does not exist. Calling `start()` multiple times is safe — concurrent calls await the same initialization.
+Starts the worker, scheduler, and reclaim loops. Creates the Consumer Group automatically if it does not exist. Calling `startWorker()` multiple times is safe — concurrent calls wait for the same initialization to complete.
+
+Only call this on **consumer** instances. Producer instances do not need it.
+
+```ts
+// Standard usage
+await q.startWorker();
+
+// If you no longer need the original Redis connection after starting:
+await q.startWorker(true);
+```
+
+> Passing `true` closes the original connection you provided in options, since RedisQ has already duplicated it internally. Useful when the original connection was created solely for constructing RedisQ.
 
 ---
 
-### `stop()`
+### `stopWorker()`
 
 Gracefully shuts down all loops and closes both internal Redis connections. A stopped instance cannot be restarted.
 
@@ -282,7 +308,7 @@ type RedisQStats = {
 
 ## Type Safety
 
-Payloads are fully inferred from your event interface, no casts needed anywhere.
+Payloads are fully inferred from your event interface — no casts needed anywhere.
 
 ```ts
 interface Events {
@@ -307,21 +333,21 @@ await q.add("resize-image", {
 });
 
 q.on("resize-image", async (job) => {
-  job.data.width; // number
+  job.data.width; // number ✓
 });
 ```
 
-The `onProcessStart` and `onProcessEnd` hooks are also fully typed, narrowing `event` automatically narrows `job.data`:
+The `onProcessStart` and `onProcessEnd` hooks are also fully typed — narrowing `event` automatically narrows `job.data`:
 
 ```ts
 const q = new RedisQ<Events>({
   redis,
   onProcessStart(event, job) {
     if (event === "send-email") {
-      console.log(job.data.to); // string
+      console.log(job.data.to); // string ✓
     }
     if (event === "resize-image") {
-      console.log(job.data.width); // number
+      console.log(job.data.width); // number ✓
     }
   },
 });
@@ -339,13 +365,11 @@ Handlers should be **idempotent** — retries and crash recovery may execute a j
 
 ### Retries
 
-Failed handlers are retried up to `retryLimit` times using exponential backoff with optional jitter. Between retries the job is held in the delay sorted set.
+Failed handlers are retried up to `retryLimit` times using exponential backoff with optional jitter. Between retries the job is held in the delay sorted set and re-promoted to the stream when its retry time comes.
 
 ### Dead Letter Queue
 
-Jobs that exceed the retry limit are moved into a dedicated DLQ stream (`redisq:dlq` by default) with their final error message and attempt count attached.
-
-DLQ jobs can be retried by manually calling `retryDLQJobs()`. The DLQ jobs will be requeued and then processed normally.
+Jobs that exceed the retry limit are moved into a dedicated DLQ stream (`redisq:dlq` by default) with their final error message and attempt count attached. DLQ jobs can be requeued at any time by calling `retryDLQJobs()`.
 
 ### Pending Recovery
 
@@ -397,8 +421,8 @@ interface RedisQOptions<Events> {
     event: EventName<Events>,
     job: Job<Events, EventName<Events>>,
   ): void;
-  onMetric?(metric: RedisQMetric): void;
   onError?(error: Error, context: string): void;
+  onMetric?(metric: RedisQMetric): void;
 }
 ```
 
@@ -420,10 +444,11 @@ RedisQ guarantees:
 
 - Use one Consumer Group per application.
 - Give every worker a unique `consumerName` (the default UUID is fine).
+- Producer instances do not need to call `startWorker()` — construct and `add()` is sufficient.
 - Monitor `onMetric`, `onProcessStart`, `onProcessEnd`, and `onError` for observability.
 - Configure `streamMaxLen` and `dlqMaxLen` to match your retention requirements.
 - Enable Redis persistence (`AOF` or `RDB`) for durability.
-- Make handlers idempotent, at-least-once delivery means a job may run more than once.
+- Make handlers idempotent — at-least-once delivery means a job may run more than once.
 
 ---
 

@@ -38,6 +38,7 @@ const DEFAULT_RECLAIM_MIN_IDLE_MS = 30_000;
 const DEFAULT_RECLAIM_BATCH_SIZE = 50;
 
 export class RedisQ<Events extends QueueEvents = QueueEvents> {
+  private readonly originalRedis: Redis;
   private readonly redis: Redis;
   private readonly workerRedis: Redis;
   private readonly streamKey: string;
@@ -105,10 +106,14 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     const rawPrefix = options.redis.options?.keyPrefix;
     const keyPrefix = typeof rawPrefix === "string" ? rawPrefix : "";
 
+    this.originalRedis = options.redis;
     // Use internal clients without ioredis keyPrefix and apply prefix ourselves.
     // This avoids command-specific keyPrefix inconsistencies (e.g. Streams commands).
-    this.redis = options.redis.duplicate({ keyPrefix: "" });
-    this.workerRedis = options.redis.duplicate({ keyPrefix: "" });
+    this.redis = options.redis.duplicate({ keyPrefix: "", lazyConnect: true });
+    this.workerRedis = options.redis.duplicate({
+      keyPrefix: "",
+      lazyConnect: true,
+    });
     this.streamKey = this.applyPrefix(
       options.streamKey ?? DEFAULT_STREAM_KEY,
       keyPrefix,
@@ -292,9 +297,13 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     );
   }
 
-  async start(): Promise<void> {
+  async startWorker(closeOriginalConnection?: boolean): Promise<void> {
     if (this.stopped) {
-      throw new Error("Cannot restart a stopped RedisQ instance");
+      throw new Error("Cannot restart a stopped RedisQ worker");
+    }
+
+    if (closeOriginalConnection) {
+      this.originalRedis.quit().catch(() => this.originalRedis.disconnect());
     }
 
     if (this.running) {
@@ -314,7 +323,7 @@ export class RedisQ<Events extends QueueEvents = QueueEvents> {
     await this.startPromise;
   }
 
-  async stop(): Promise<void> {
+  async stopWorker(): Promise<void> {
     this.running = false;
     this.stopped = true;
 
